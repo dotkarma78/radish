@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+
+from argparse import ArgumentParser, Namespace
+from configparser import ConfigParser
+from os import close, execv, read, wait, write
+from pty import fork
+from selectors import DefaultSelector, EVENT_READ, SelectorKey
+from signal import signal, SIGCHLD, SIG_IGN
+from socket import socket, SO_REUSEADDR, SOL_SOCKET
+from sys import stdin, stdout
+from tty import setcbreak
+
+argument_parser: ArgumentParser = ArgumentParser()
+argument_parser.add_argument('-s', '--server', action = 'store_true')
+arguments: Namespace = argument_parser.parse_args()
+
+config_parser: ConfigParser = ConfigParser()
+config_parser.read('radish.conf')
+ADDRESS: str = config_parser.get('server', 'address')
+PORT: int = int(config_parser.get('server', 'port'))
+ENDPOINT: tuple[str, int] = (ADDRESS, PORT)
+BUFFER_SIZE: int = int(config_parser.get('buffer', 'size'))
+
+if arguments.server:
+    selector: DefaultSelector = DefaultSelector()
+
+    server_socket: socket = socket()
+    server_socket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+    server_socket.setblocking(False)
+    server_socket.bind(ENDPOINT)
+    server_socket.listen()
+
+    selector.register(server_socket, EVENT_READ, 'server_socket')
+
+    sockets: dict[int, socket] = {}
+    clients: dict[socket, dict[str, tuple[str, int] | int]] = {}
+
+    write(stdout.fileno(), f'\033[0;34m[i]\033[0m Started server at {ADDRESS}:{PORT}.\n'.encode())
+
+    signal(SIGCHLD, SIG_IGN)
+
+    while True:
+        key: SelectorKey; mask: int
+        for key, mask in selector.select():
+            if key.data == 'server_socket':
+                client_socket: socket; endpoint: tuple[str, int]
+                client_socket, endpoint = server_socket.accept()
+                client_socket.setblocking(False)
+
+                process_identifier: int; master_file_descriptor: int
+                process_identifier, master_file_descriptor = fork()
+                if process_identifier == 0:
+                    execv('/usr/bin/zsh', ['/usr/bin/zsh'])
+                else:
+                    selector.register(client_socket, EVENT_READ, 'client_socket')
+                    selector.register(master_file_descriptor, EVENT_READ, 'master_file_descriptor')
+
+                    sockets[master_file_descriptor] = client_socket
+                    clients[client_socket] = {'endpoint': endpoint, 'master_file_descriptor': master_file_descriptor}
+
+                write(stdout.fileno(), f'\033[0;32m[+]\033[0m Accepted client from {endpoint[0]}:{endpoint[1]}.\n'.encode())
+
+            elif key.data == 'client_socket':
+                buffer: bytes = key.fileobj.recv(BUFFER_SIZE)
+                if buffer:
+                    write(clients[key.fileobj]['master_file_descriptor'], buffer)
+                else:
+                    key.fileobj.close()
+                    close(clients[key.fileobj]['master_file_descriptor'])
+                    selector.unregister(key.fileobj)
+                    selector.unregister(clients[key.fileobj]['master_file_descriptor'])
+                    write(stdout.fileno(),f'\033[0;31m[-]\033[0m Closed client from {clients[key.fileobj]['endpoint'][0]}:{clients[key.fileobj]['endpoint'][1]}.\n'.encode())
+                    del sockets[clients[key.fileobj]['master_file_descriptor']]
+                    del clients[key.fileobj]
+
+            elif key.data == 'master_file_descriptor':
+                try:
+                    buffer: bytes = read(key.fd, BUFFER_SIZE)
+                    if buffer:
+                        sockets[key.fd].sendall(buffer)
+                    else:
+                        sockets[key.fd].close()
+                        close(key.fd)
+                        selector.unregister(sockets[key.fd])
+                        selector.unregister(key.fd)
+                        write(stdout.fileno(),
+                              f'\033[0;31m[-]\033[0m Closed client from {clients[sockets[key.fd]]['endpoint'][0]}:{clients[sockets[key.fd]]['endpoint'][1]}.\n'.encode())
+                        del clients[sockets[key.fd]]
+                        del sockets[key.fd]
+
+                except OSError:
+                    sockets[key.fd].close()
+                    close(key.fd)
+                    selector.unregister(sockets[key.fd])
+                    selector.unregister(key.fd)
+                    write(stdout.fileno(), f'\033[0;31m[-]\033[0m Closed client from {clients[sockets[key.fd]]['endpoint'][0]}:{clients[sockets[key.fd]]['endpoint'][1]}.\n'.encode())
+                    del clients[sockets[key.fd]]
+                    del sockets[key.fd]
+
+else:
+    selector: DefaultSelector = DefaultSelector()
+
+    client_socket: socket = socket()
+    client_socket.connect(ENDPOINT)
+    client_socket.setblocking(False)
+
+    selector.register(client_socket, EVENT_READ, 'client_socket')
+    setcbreak(stdin)
+    selector.register(stdin, EVENT_READ, 'stdin')
+
+    while True:
+        key: SelectorKey; mask: int
+        for key, mask in selector.select():
+            if key.data == 'client_socket':
+                buffer: bytes = client_socket.recv(BUFFER_SIZE)
+                if buffer:
+                    write(stdout.fileno(), buffer)
+                else:
+                    client_socket.close()
+                    selector.unregister(client_socket)
+                    exit()
+
+            elif key.data == 'stdin':
+                client_socket.sendall(read(stdin.fileno(), BUFFER_SIZE))
