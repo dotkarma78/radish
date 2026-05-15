@@ -1,142 +1,197 @@
 #!/usr/bin/env python3
 
 from argparse import ArgumentParser, Namespace
-from configparser import ConfigParser
-from os import close, execv, read, write
+from os import chdir, close, environ, execv, kill, read, setgid, setuid, write
+from typing import Any
+from pam import pam
 from pty import fork
+from pwd import getpwnam
+from socket import SO_REUSEADDR, socket as Socket, SOL_SOCKET
 from selectors import DefaultSelector, EVENT_READ, SelectorKey
-from signal import signal, SIGCHLD, SIG_IGN
-from socket import socket, SO_REUSEADDR, SOL_SOCKET
-from sys import stdin, stdout
-from tty import setcbreak
+from sys import stdin, stderr, stdout
+from termios import tcgetattr, tcsetattr, TCSADRAIN
+from tty import setraw
+
+BUFFER_SIZE: int = 4096
 
 argument_parser: ArgumentParser = ArgumentParser()
 argument_parser.add_argument('-s', '--server', action = 'store_true')
-arguments: Namespace = argument_parser.parse_args()
+argument_parser.add_argument('-a', '--address', default = '127.0.0.1', type = str)
+argument_parser.add_argument('-p', '--port', default = 8078, type = int)
+argument_parser.add_argument('-u', '--username', type = str)
+arguments: Namespace = argument_parser.parse_args(
+)
 
-config_parser: ConfigParser = ConfigParser()
-config_parser.read('radish.conf')
-SOURCE_ADDRESS: str = config_parser.get('server', 'source_address')
-SOURCE_PORT: int = int(config_parser.get('server', 'source_port'))
-DESTINATION_ADDRESS: str = config_parser.get('client', 'destination_address')
-DESTINATION_PORT: int = int(config_parser.get('client', 'destination_port'))
-SOURCE_ENDPOINT: tuple[str, int] = (SOURCE_ADDRESS, SOURCE_PORT)
-DESTINATION_ENDPOINT: tuple[str, int] = (DESTINATION_ADDRESS, DESTINATION_PORT)
-BUFFER_SIZE: int = int(config_parser.get('buffer', 'size'))
+server: bool = arguments.server
+address: str = arguments.address
+port: int = arguments.port
+endpoint: tuple[str, int] = (address, port)
+username: str = arguments.username
+if not server and username is None:
+    raise ValueError
 
-if arguments.server:
+if server:
     selector: DefaultSelector = DefaultSelector()
-
-    server_socket: socket = socket()
+    server_socket: Socket = Socket()
     server_socket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
     server_socket.setblocking(False)
-    server_socket.bind(SOURCE_ENDPOINT)
+    server_socket.bind(endpoint)
     server_socket.listen()
-
     selector.register(server_socket, EVENT_READ, 'server_socket')
-
-    sockets: dict[int, socket] = {}
-    clients: dict[socket, dict[str, tuple[str, int] | int]] = {}
-
-    write(stdout.fileno(), f'\033[0;34m[i]\033[0m Started server at {SOURCE_ADDRESS}:{SOURCE_PORT}.\n'.encode())
-
-    signal(SIGCHLD, SIG_IGN)
+    sockets = {}
+    clients = {}
+    write(stdout.fileno(), f'\x1b[0;34m[i]\x1b[0m Started server at {address}:{port}.\n'.encode())
 
     try:
-        while True:
+        while server_socket:
             key: SelectorKey; mask: int
             for key, mask in selector.select():
                 if key.data == 'server_socket':
-                    client_socket: socket; endpoint: tuple[str, int]
+                    client_socket: Socket; endpoint: tuple[str, int]
                     client_socket, endpoint = server_socket.accept()
-                    client_socket.setblocking(False)
+                    address: str; port: int
+                    address, port = endpoint[0], endpoint[1]
+                    write(stdout.fileno(), f'\x1b[0;34m[i]\x1b[0m Connected client at {address}:{port}.\n'.encode())
 
-                    process_identifier: int; master_file_descriptor: int
-                    process_identifier, master_file_descriptor = fork()
-                    if process_identifier == 0:
-                        execv('/usr/bin/zsh', ['/usr/bin/zsh'])
-                    else:
-                        selector.register(client_socket, EVENT_READ, 'client_socket')
-                        selector.register(master_file_descriptor, EVENT_READ, 'master_file_descriptor')
-
-                        sockets[master_file_descriptor] = client_socket
-                        clients[client_socket] = {'endpoint': endpoint, 'master_file_descriptor': master_file_descriptor}
-
-                    write(stdout.fileno(), f'\033[0;32m[+]\033[0m Accepted client at {endpoint[0]}:{endpoint[1]}.\n'.encode())
-
-                elif key.data == 'client_socket':
-                    buffer: bytes = key.fileobj.recv(BUFFER_SIZE)
-                    if buffer:
-                        write(clients[key.fileobj]['master_file_descriptor'], buffer)
-                    else:
-                        key.fileobj.close()
-                        close(clients[key.fileobj]['master_file_descriptor'])
-                        selector.unregister(key.fileobj)
-                        selector.unregister(clients[key.fileobj]['master_file_descriptor'])
-                        write(stdout.fileno(),f'\033[0;31m[-]\033[0m Disconnected client from {clients[key.fileobj]['endpoint'][0]}:{clients[key.fileobj]['endpoint'][1]}.\n'.encode())
-                        del sockets[clients[key.fileobj]['master_file_descriptor']]
-                        del clients[key.fileobj]
-
-                elif key.data == 'master_file_descriptor':
+                    buffer: bytes = client_socket.recv(BUFFER_SIZE)
+                    username: str; password: str
                     try:
-                        buffer: bytes = read(key.fd, BUFFER_SIZE)
-                        if buffer:
-                            sockets[key.fd].sendall(buffer)
+                        username, password = buffer.decode().split('\n')
+                    except ValueError:
+                        write(stderr.fileno(), f'\x1b[0;33m[!]\x1b[0m Rejected client at {address}:{port}.\n'.encode())
+                        write(stdout.fileno(), f'\x1b[0;34m[i]\x1b[0m Disconnected client at {address}:{port}.\n'.encode())
+                        continue
+                    pam_authenticator: pam = pam()
+                    if pam_authenticator.authenticate(username, password):
+                        del password
+                        group_identifier: int = getpwnam(username).pw_gid
+                        user_identifier: int = getpwnam(username).pw_uid
+                        home: str = getpwnam(username).pw_dir
+                        shell: str = getpwnam(username).pw_shell
+                        process_identifier: int; master_file_descriptor: int
+                        process_identifier, master_file_descriptor = fork()
+                        if process_identifier == 0:
+                            setgid(group_identifier)
+                            setuid(user_identifier)
+                            environ['USER'] = username
+                            environ['LOGNAME'] = username
+                            chdir(home)
+                            environ['HOME'] = home
+                            environ['PWD'] = home
+                            execv(shell, [shell, '-il'])
                         else:
-                            sockets[key.fd].close()
-                            close(key.fd)
-                            selector.unregister(sockets[key.fd])
-                            selector.unregister(key.fd)
-                            write(stdout.fileno(),
-                                  f'\033[0;31m[-]\033[0m Disconnected client at {clients[sockets[key.fd]]['endpoint'][0]}:{clients[sockets[key.fd]]['endpoint'][1]}.\n'.encode())
-                            del clients[sockets[key.fd]]
-                            del sockets[key.fd]
-
-                    except OSError:
-                        sockets[key.fd].close()
-                        close(key.fd)
-                        selector.unregister(sockets[key.fd])
-                        selector.unregister(key.fd)
-                        write(stdout.fileno(), f'\033[0;31m[-]\033[0m Disconnected client at {clients[sockets[key.fd]]['endpoint'][0]}:{clients[sockets[key.fd]]['endpoint'][1]}.\n'.encode())
-                        del clients[sockets[key.fd]]
-                        del sockets[key.fd]
-
-    except KeyboardInterrupt:
-        write(stdout.fileno(), f'\r\033[0;33m[!]\033[0m Closed server at {SOURCE_ADDRESS}:{SOURCE_PORT}.\n'.encode())
-        exit()
-
-else:
-    selector: DefaultSelector = DefaultSelector()
-
-    client_socket: socket = socket()
-    client_socket.connect(DESTINATION_ENDPOINT)
-    client_socket.setblocking(False)
-
-    selector.register(client_socket, EVENT_READ, 'client_socket')
-    setcbreak(stdin)
-    selector.register(stdin, EVENT_READ, 'stdin')
-
-    write(stdout.fileno(), f'\r\033[0;32m[+]\033[0m Connected client to {DESTINATION_ADDRESS}:{DESTINATION_PORT}.\n'.encode())
-
-    try:
-        while True:
-            key: SelectorKey; mask: int
-            for key, mask in selector.select():
-                if key.data == 'client_socket':
+                            selector.register(client_socket, EVENT_READ, 'client_socket')
+                            selector.register(master_file_descriptor, EVENT_READ, 'master_file_descriptor')
+                            sockets[master_file_descriptor] = client_socket
+                            clients[client_socket] = {
+                                'endpoint': endpoint,
+                                'address': address,
+                                'port': port,
+                                'username': username,
+                                'group_identifier': group_identifier,
+                                'user_identifier': user_identifier,
+                                'process_identifier': process_identifier,
+                                'master_file_descriptor': master_file_descriptor
+                            }
+                        client_socket.setblocking(False)
+                        write(stdout.fileno(), f'\x1b[0;32m[+]\x1b[0m Authorized client at {address}:{port}.\n'.encode())
+                    else:
+                        del password
+                        client_socket.close()
+                        write(stderr.fileno(), f'\x1b[0;33m[!]\x1b[0m Rejected client at {address}:{port}.\n'.encode())
+                        write(stdout.fileno(), f'\x1b[0;34m[i]\x1b[0m Disconnected client at {address}:{port}.\n'.encode())
+                elif key.data == 'client_socket':
+                    client_socket: Socket = key.fileobj
+                    master_file_descriptor: int = clients[client_socket]['master_file_descriptor']
                     buffer: bytes = client_socket.recv(BUFFER_SIZE)
                     if buffer:
-                        write(stdout.fileno(), buffer)
+                        write(master_file_descriptor, buffer)
                     else:
                         client_socket.close()
+                        close(master_file_descriptor)
                         selector.unregister(client_socket)
-                        write(stdout.fileno(), f'\r\033[0;31m[-]\033[0m Disconnected client from {DESTINATION_ADDRESS}:{DESTINATION_PORT}.\n'.encode())
-                        exit()
-
-                elif key.data == 'stdin':
-                    client_socket.sendall(read(stdin.fileno(), BUFFER_SIZE))
-
+                        selector.unregister(master_file_descriptor)
+                        process_identifier: int = clients[client_socket]['process_identifier']
+                        kill(process_identifier, 2)
+                        address: str = clients[client_socket]['address']
+                        port: int = clients[client_socket]['port']
+                        del clients[client_socket]
+                        write(stdout.fileno(), f'\x1b[0;34m[i]\x1b[0m Disconnected client at {address}:{port}.\n'.encode())
+                elif key.data == 'master_file_descriptor':
+                    master_file_descriptor: int = key.fd
+                    client_socket: Socket = sockets[master_file_descriptor]
+                    try:
+                        buffer: bytes = read(master_file_descriptor, BUFFER_SIZE)
+                        if buffer:
+                            client_socket.sendall(buffer)
+                        else:
+                            client_socket.close()
+                            close(master_file_descriptor)
+                            selector.unregister(client_socket)
+                            selector.unregister(master_file_descriptor)
+                            process_identifier: int = clients[client_socket]['process_identifier']
+                            kill(process_identifier, 2)
+                            address: str = clients[client_socket]['address']
+                            port: int = clients[client_socket]['port']
+                            del clients[client_socket]
+                            write(stdout.fileno(), f'\x1b[0;34m[i]\x1b[0m Disconnected client at {address}:{port}.\n'.encode())
+                    except OSError:
+                        client_socket.close()
+                        close(master_file_descriptor)
+                        selector.unregister(client_socket)
+                        selector.unregister(master_file_descriptor)
+                        process_identifier: int = clients[client_socket]['process_identifier']
+                        kill(process_identifier, 2)
+                        address: str = clients[client_socket]['address']
+                        port: int = clients[client_socket]['port']
+                        del clients[client_socket]
+                        write(stdout.fileno(), f'\x1b[0;34m[i]\x1b[0m Disconnected client at {address}:{port}.\n'.encode())
     except KeyboardInterrupt:
-        client_socket.close()
-        selector.unregister(client_socket)
-        write(stdout.fileno(), f'\n\033[0;31m[-]\033[0m Disconnected client from {DESTINATION_ADDRESS}:{DESTINATION_PORT}.\n'.encode())
-        exit()
+        client: Socket
+        for client in clients:
+            client.sendall(b'\n\r')
+        server_socket.close()
+        selector.unregister(server_socket)
+        write(stdout.fileno(), f'\r\x1b[0;34m[i]\x1b[0m Stopped server at {address}:{port}.\n\r'.encode())
+else:
+    selector: DefaultSelector = DefaultSelector()
+    socket: Socket = Socket()
+    socket.connect(endpoint)
+    write(stdout.fileno(), f'\x1b[0;34m[i]\x1b[0m Connected to server at {address}:{port}.\n'.encode())
+    try:
+        password: str = input(f'\x1b[35m[?]\x1b[0m {username}\'s password: \x1b[8m\x1b[?25l')
+    except KeyboardInterrupt:
+        write(stdout.fileno(), b'\x1b[0m\x1b[?25h')
+        exit(1)
+    write(stdout.fileno(), b'\x1b[0m\x1b[?25h')
+    socket.sendall(f'{username}\n{password}'.encode())    # sending plaintext passwords over the network :)
+    buffer: bytes = socket.recv(BUFFER_SIZE)
+    if buffer:
+        socket.setblocking(False)
+        selector.register(socket, EVENT_READ, 'socket')
+        old_attributes: list[Any] = tcgetattr(stdin)
+        setraw(stdin)
+        selector.register(stdin, EVENT_READ, 'stdin')
+        write(stdout.fileno(), f'\x1b[0;32m[+]\x1b[0m Authorized by server at {address}:{port}.\n\r'.encode())
+        while socket:
+            key: SelectorKey; mask: int
+            for key, mask in selector.select():
+                if key.data == 'socket':
+                    buffer: bytes = socket.recv(BUFFER_SIZE)
+                    if buffer and not buffer == b'\n\r':
+                        write(stdout.fileno(), buffer)
+                    else:
+                        if buffer == b'\n\r':
+                            write(stdout.fileno(), buffer)
+                        socket.close()
+                        selector.unregister(socket)
+                        selector.unregister(stdin)
+                        write(stdout.fileno(), f'\x1b[0;34m[i]\x1b[0m Disconnected by server at {address}:{port}.\n\r'.encode())
+                        tcsetattr(stdin, TCSADRAIN, old_attributes)
+                        exit(1)
+                elif key.data == 'stdin':
+                    buffer: bytes = read(stdin.fileno(), BUFFER_SIZE)
+                    socket.sendall(buffer)
+    else:
+        write(stdout.fileno(), f'\x1b[0;33m[!]\x1b[0m Rejected by server at {address}:{port}.\n'.encode())
+        write(stdout.fileno(), f'\x1b[0;34m[i]\x1b[0m Disconnected by server at {address}:{port}.\n\r'.encode())
