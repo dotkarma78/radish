@@ -8,6 +8,7 @@ from pty import fork
 from pwd import getpwnam
 from socket import SO_REUSEADDR, socket as Socket, SOL_SOCKET
 from selectors import DefaultSelector, EVENT_READ, SelectorKey
+from ssl import PROTOCOL_TLS_CLIENT, PROTOCOL_TLS_SERVER, SSLContext, TLSVersion
 from sys import stdin, stderr, stdout
 from termios import tcgetattr, tcsetattr, TCSADRAIN
 from tty import setraw
@@ -31,6 +32,9 @@ if not server and username is None:
     raise ValueError
 
 if server:
+    tls_context: SSLContext = SSLContext(PROTOCOL_TLS_SERVER)
+    tls_context.minimum_version = TLSVersion.TLSv1_3
+    tls_context.load_cert_chain('cert.pem', 'key.pem')
     selector: DefaultSelector = DefaultSelector()
     server_socket: Socket = Socket()
     server_socket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
@@ -49,6 +53,7 @@ if server:
                 if key.data == 'server_socket':
                     client_socket: Socket; endpoint: tuple[str, int]
                     client_socket, endpoint = server_socket.accept()
+                    client_socket = tls_context.wrap_socket(client_socket, True)
                     address: str; port: int
                     address, port = endpoint[0], endpoint[1]
                     write(stdout.fileno(), f'\x1b[0;34m[i]\x1b[0m Connected client at {address}:{port}.\n'.encode())
@@ -154,18 +159,21 @@ if server:
         selector.unregister(server_socket)
         write(stdout.fileno(), f'\r\x1b[0;34m[i]\x1b[0m Stopped server at {address}:{port}.\n\r'.encode())
 else:
+    tls_context: SSLContext = SSLContext(PROTOCOL_TLS_CLIENT)
+    tls_context.minimum_version = TLSVersion.TLSv1_3
+    tls_context.load_verify_locations('cert.pem')
     selector: DefaultSelector = DefaultSelector()
     socket: Socket = Socket()
     socket.connect(endpoint)
+    socket = tls_context.wrap_socket(socket, server_hostname = address)
     write(stdout.fileno(), f'\x1b[0;34m[i]\x1b[0m Connected to server at {address}:{port}.\n'.encode())
-    write(stdout.fileno(), f'\x1b[0;33m[!]\x1b[0m \x1b[1;37mWARNING:\x1b[0m Unencrypted network traffic! All data including credentials are transmitted as plaintext. Usage outside of localhost risks data theft, even inside trusted local networks.\n'.encode())
     try:
         password: str = input(f'\x1b[35m[?]\x1b[0m {username}\'s password: \x1b[8m\x1b[?25l')
     except KeyboardInterrupt:
         write(stdout.fileno(), b'\x1b[0m\x1b[?25h')
         exit(1)
     write(stdout.fileno(), b'\x1b[0m\x1b[?25h')
-    socket.sendall(f'{username}\n{password}'.encode())    # sending plaintext passwords over the network :)
+    socket.sendall(f'{username}\n{password}'.encode())
     buffer: bytes = socket.recv(BUFFER_SIZE)
     if buffer:
         socket.setblocking(False)
