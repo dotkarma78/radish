@@ -120,6 +120,7 @@ if server:
                         kill(process_identifier, 2)
                         address: str = clients[client_socket]['address']
                         port: int = clients[client_socket]['port']
+                        del sockets[master_file_descriptor]
                         del clients[client_socket]
                         write(stdout.fileno(), f'\x1b[0;34m[i]\x1b[0m Disconnected client at {address}:{port}.\n'.encode())
                 elif key.data == 'master_file_descriptor':
@@ -138,6 +139,7 @@ if server:
                             kill(process_identifier, 2)
                             address: str = clients[client_socket]['address']
                             port: int = clients[client_socket]['port']
+                            del sockets[master_file_descriptor]
                             del clients[client_socket]
                             write(stdout.fileno(), f'\x1b[0;34m[i]\x1b[0m Disconnected client at {address}:{port}.\n'.encode())
                     except OSError:
@@ -149,6 +151,7 @@ if server:
                         kill(process_identifier, 2)
                         address: str = clients[client_socket]['address']
                         port: int = clients[client_socket]['port']
+                        del sockets[master_file_descriptor]
                         del clients[client_socket]
                         write(stdout.fileno(), f'\x1b[0;34m[i]\x1b[0m Disconnected client at {address}:{port}.\n'.encode())
     except KeyboardInterrupt:
@@ -164,8 +167,8 @@ else:
     tls_context.load_verify_locations('cert.pem')
     selector: DefaultSelector = DefaultSelector()
     socket: Socket = Socket()
+    socket = tls_context.wrap_socket(socket, server_hostname=address)
     socket.connect(endpoint)
-    socket = tls_context.wrap_socket(socket, server_hostname = address)
     write(stdout.fileno(), f'\x1b[0;34m[i]\x1b[0m Connected to server at {address}:{port}.\n'.encode())
     try:
         password: str = input(f'\x1b[35m[?]\x1b[0m {username}\'s password: \x1b[8m\x1b[?25l')
@@ -174,6 +177,7 @@ else:
         exit(1)
     write(stdout.fileno(), b'\x1b[0m\x1b[?25h')
     socket.sendall(f'{username}\n{password}'.encode())
+    del password
     buffer: bytes = socket.recv(BUFFER_SIZE)
     if buffer:
         socket.setblocking(False)
