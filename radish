@@ -158,7 +158,7 @@ else:
     socket: Socket = Socket()
     socket.connect(endpoint)
     write(stdout.fileno(), f'\x1b[0;34m[i]\x1b[0m Connected to server at {address}:{port}.\n'.encode())
-    write(stdout.fileno(), f'\x1b[0;33m[!]\x1b[0m WARNING: Network traffic encryption does NOT take place. Do not use this script outside of localhost. Sending vulnerable information (including the current password to connect) may lead to it getting stolen.\n'.encode())
+    write(stdout.fileno(), f'\x1b[0;33m[!]\x1b[0m \x1b[1;37mWARNING:\x1b[0m Unencrypted network traffic! All data including credentials are transmitted as plaintext. Usage outside of localhost risks data theft, even inside trusted local networks.\n'.encode())
     try:
         password: str = input(f'\x1b[35m[?]\x1b[0m {username}\'s password: \x1b[8m\x1b[?25l')
     except KeyboardInterrupt:
