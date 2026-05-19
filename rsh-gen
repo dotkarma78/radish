@@ -1,0 +1,20 @@
+#!/usr/bin/env sh
+
+set -e
+
+HOST="$(hostname)"
+
+RADISH_DIRECTORY="$HOME/.radish"
+CERTIFICATE_DIRECTORY="$RADISH_DIRECTORY/crts"
+
+mkdir -p "$CERTIFICATE_DIRECTORY"
+
+CERTIFICATE_FILE="$RADISH_DIRECTORY/$HOST.crt"
+KEY_FILE="$RADISH_DIRECTORY/$HOST.key"
+
+openssl req -x509 -newkey ec -pkeyopt 'ec_paramgen_curve:P-256' \
+	--subj "/CN=127.0.0.1" --addext "subjectAltName=IP:127.0.0.1,DNS:localhost,DNS:$HOST" \
+	-noenc -days 7 \
+	-out "$CERTIFICATE_FILE" -keyout "$KEY_FILE"
+
+chmod 600 "$KEY_FILE"
